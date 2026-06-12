@@ -125,6 +125,16 @@ def accuracy_estimator(
     return Estimator(circuit_depth=circuit_depth, op_types=list(op_types), encoding=encoding)
 
 
+def apc_counting_std(n_terms: int, length: int, encoding: Encoding = "bipolar") -> float:
+    """Worst-case std of an APC-accumulated k-term average at stream length L.
+
+    Each of the k product streams is counted exactly every clock, so the
+    per-term variances average down: var <= (1/k^2) * k * worst_per_term
+    = worst_per_term / k, i.e. the MUX counting std divided by sqrt(k).
+    """
+    return counting_std(length, encoding) / math.sqrt(n_terms)
+
+
 def sc_noise_std(value: Tensor, length: int, encoding: Encoding) -> Tensor:
     """Per-element counting-noise standard deviation of a materialized stream.
 

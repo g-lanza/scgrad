@@ -17,6 +17,7 @@ from torch import Tensor
 
 Encoding = Literal["unipolar", "bipolar"]
 Source = Literal["lfsr", "sobol"]
+Accumulator = Literal["mux", "apc"]
 
 _RANGES: dict[str, tuple[float, float]] = {"unipolar": (0.0, 1.0), "bipolar": (-1.0, 1.0)}
 
@@ -37,7 +38,15 @@ class SCConfig:
     exactly as they would on silicon with a shared RNG. None means every
     id gets its own generator. noise enables training-time injection of
     the analytic SC counting noise (see layers.py); it has no effect on
-    the exact path.
+    the exact path. accumulator selects how layers sum their products:
+    "mux" is the classical scaled-average MUX tree (one selected term
+    per clock; counting variance ~ p(1-p)/N regardless of fan-in);
+    "apc" is the accumulative parallel counter used by published SC
+    accelerators (every product bit counted every clock; variance
+    smaller by the fan-in factor, at the hardware cost of a binary
+    adder tree). Both produce the same expected value and the same
+    scale bookkeeping; they differ in noise, which is the trade the
+    library exists to expose.
     """
 
     encoding: Encoding = "bipolar"
@@ -46,6 +55,7 @@ class SCConfig:
     seed: int | None = None
     n_rngs: int | None = None
     noise: bool = False
+    accumulator: Accumulator = "mux"
 
     def rng_index(self, corr_id: int) -> int:
         """Map a correlation id onto a physical generator index."""

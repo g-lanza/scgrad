@@ -109,12 +109,85 @@ def _mux_linear_counts(
     return counts
 
 
+def _apc_linear_value(
+    x_vals: Tensor,
+    w_vals: Tensor,
+    bias_vals: Tensor | None,
+    config: SCConfig,
+    x_id: int,
+    w_id: int,
+    b_id: int,
+) -> Tensor:
+    """Exact APC-accumulated multiply: every product bit counted every clock.
+
+    The accumulative parallel counter sums all k gate outputs each time
+    step into a binary count (no selection, hence no selection noise),
+    then normalizes by k in the binary domain. Counting XNOR/AND ones
+    across both the term and time axes is a matmul over the flattened
+    (term, time) axis, blocked over time chunks and batch rows to bound
+    memory. Counts stay below 2^24 per block, exact in float32.
+    """
+    n = config.length
+    k_in = x_vals.shape[-1]
+    n_batch, n_out = x_vals.shape[0], w_vals.shape[0]
+    source: BitstreamSource = make_source(config)
+    p_x = value_to_probability(x_vals.detach(), config.encoding).to(torch.float32)
+    p_w = value_to_probability(w_vals.detach(), config.encoding).to(torch.float32)
+    r_x = source.uniforms(n, x_id).to(torch.float32)
+    r_w = source.uniforms(n, w_id).to(torch.float32)
+    ones = torch.zeros(n_batch, n_out, dtype=torch.float32)
+    zeros = torch.zeros(n_batch, n_out, dtype=torch.float32)
+    for start in range(0, n, _CHUNK):
+        stop = min(start + _CHUNK, n)
+        c = stop - start
+        w_bits = r_w[start:stop] < p_w.unsqueeze(-1)
+        wf = w_bits.reshape(n_out, k_in * c).to(torch.float32)
+        wzf = (~w_bits).reshape(n_out, k_in * c).to(torch.float32)
+        row_block = max(1, 2**24 // max(k_in * c, 1))
+        for rs in range(0, n_batch, row_block):
+            r_end = min(rs + row_block, n_batch)
+            x_bits = r_x[start:stop] < p_x[rs:r_end].unsqueeze(-1)
+            xf = x_bits.reshape(r_end - rs, k_in * c).to(torch.float32)
+            ones[rs:r_end] += xf @ wf.t()
+            if config.encoding == "bipolar":
+                zeros[rs:r_end] += (1.0 - xf) @ wzf.t()
+    is_bipolar = config.encoding == "bipolar"
+    sum_v = 2.0 * (ones + zeros) / n - float(k_in) if is_bipolar else ones / n
+    k_terms = k_in
+    if bias_vals is not None:
+        k_terms += 1
+        p_b = value_to_probability(bias_vals.detach(), config.encoding).to(torch.float32)
+        r_b = source.uniforms(n, b_id).to(torch.float32)
+        count_b = (r_b < p_b.unsqueeze(-1)).sum(dim=-1).to(torch.float32)
+        v_b = 2.0 * count_b / n - 1.0 if config.encoding == "bipolar" else count_b / n
+        sum_v = sum_v + v_b
+    return sum_v / k_terms
+
+
+def _linear_stage_value(
+    x_vals: Tensor,
+    w_vals: Tensor,
+    bias_vals: Tensor | None,
+    config: SCConfig,
+    x_id: int,
+    w_id: int,
+    b_id: int,
+    out_id: int,
+) -> Tensor:
+    """Counted physical output value of one linear stage under the config's accumulator."""
+    if config.accumulator == "apc":
+        return _apc_linear_value(x_vals, w_vals, bias_vals, config, x_id, w_id, b_id)
+    counts = _mux_linear_counts(x_vals, w_vals, bias_vals, config, x_id, w_id, b_id, out_id)
+    p_hat = counts / config.length
+    return p_hat if config.encoding == "unipolar" else 2.0 * p_hat - 1.0
+
+
 def _exact_linear(state: _ExactState, layer: SCLinear, config: SCConfig) -> _ExactState:
     w = layer.weight.detach().clamp(*_enc_range(config))
     bias = None
     if layer.bias is not None:
         bias = (state.scale * layer.bias.detach()).clamp(*_enc_range(config))
-    counts = _mux_linear_counts(
+    value = _linear_stage_value(
         state.value,
         w,
         bias,
@@ -124,8 +197,6 @@ def _exact_linear(state: _ExactState, layer: SCLinear, config: SCConfig) -> _Exa
         layer.bias_corr_id,
         layer.output_corr_id,
     )
-    p_hat = counts / config.length
-    value = p_hat if config.encoding == "unipolar" else 2.0 * p_hat - 1.0
     return _ExactState(value, state.scale / layer.fan_in, layer.output_corr_id)
 
 
@@ -145,7 +216,7 @@ def _exact_conv(state: _ExactState, layer: SCConv2d, config: SCConfig) -> _Exact
     bias = None
     if layer.bias is not None:
         bias = (state.scale * layer.bias.detach()).clamp(*_enc_range(config))
-    counts = _mux_linear_counts(
+    value = _linear_stage_value(
         flat,
         w_flat,
         bias,
@@ -155,8 +226,6 @@ def _exact_conv(state: _ExactState, layer: SCConv2d, config: SCConfig) -> _Exact
         layer.bias_corr_id,
         layer.output_corr_id,
     )
-    p_hat = counts / config.length
-    value = p_hat if config.encoding == "unipolar" else 2.0 * p_hat - 1.0
     value = value.reshape(batch, n_loc, layer.out_channels).transpose(1, 2)
     value = value.reshape(batch, layer.out_channels, out_h, out_w)
     return _ExactState(value, state.scale / layer.fan_in, layer.output_corr_id)

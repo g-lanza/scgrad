@@ -130,7 +130,7 @@ class SobolSource:
         engine = torch.quasirandom.SobolEngine(  # type: ignore[no-untyped-call]
             dimension=dim + 1, scramble=False
         )
-        engine.fast_forward(1 + self.seed * 64)
+        engine.fast_forward(1 + self.seed * 64)  # type: ignore[no-untyped-call]
         return engine.draw(n, dtype=torch.float64)[:, dim]
 
     def bits(self, p: Tensor, n: int, corr_id: int) -> Tensor:

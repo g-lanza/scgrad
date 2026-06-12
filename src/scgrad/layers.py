@@ -48,13 +48,62 @@ from scgrad.encoding import (
 )
 
 
-def _apply_noise(value: Tensor, config: SCConfig, training: bool) -> Tensor:
-    """Inject analytic SC counting noise during training (reparameterized)."""
+def _apply_noise(
+    value: Tensor, config: SCConfig, training: bool, term_var_sum: Tensor | None = None
+) -> Tensor:
+    """Inject analytic SC counting noise during training (reparameterized).
+
+    MUX accumulation: the output is one counted stream, so the noise is
+    the single-stream counting std of the output value. APC accumulation:
+    every term stream is counted exactly, so the output variance is the
+    sum of per-term counting variances divided by k^2; the caller passes
+    term_var_sum = sum_j var_numerator_j (bipolar: 1 - v_j^2; unipolar:
+    p_j(1 - p_j)) already divided by k^2, and this function scales by
+    1/length. The std is detached: the gradient flows through the value,
+    not through the noise magnitude.
+    """
     if not (config.noise and training):
         return value
-    std = sc_noise_std(value.detach(), config.length, config.encoding)
+    if config.accumulator == "mux" or term_var_sum is None:
+        std = sc_noise_std(value.detach(), config.length, config.encoding)
+    else:
+        std = torch.sqrt(torch.clamp(term_var_sum.detach(), min=0.0) / config.length)
     noisy = value + std * torch.randn_like(value)
     return clamp_ste(noisy, config.encoding)
+
+
+def _apc_term_var_sum(
+    x_val: Tensor, w: Tensor, b_enc: Tensor | None, k: int, cfg: SCConfig
+) -> Tensor:
+    """Per-output sum of APC term counting-variance numerators over k^2 (linear)."""
+    with torch.no_grad():
+        if cfg.encoding == "bipolar":
+            s = x_val.shape[-1] - (x_val**2) @ (w**2).t()
+            if b_enc is not None:
+                s = s + (1.0 - b_enc**2)
+        else:
+            s = x_val @ w.t() - (x_val**2) @ (w**2).t()
+            if b_enc is not None:
+                s = s + b_enc * (1.0 - b_enc)
+    return s / (k * k)
+
+
+def _apc_term_var_sum_conv(
+    patches: Tensor, w_flat: Tensor, b_enc: Tensor | None, k: int, cfg: SCConfig
+) -> Tensor:
+    """Per-output sum of APC term counting-variance numerators over k^2 (conv)."""
+    with torch.no_grad():
+        if cfg.encoding == "bipolar":
+            s = patches.shape[1] - torch.einsum("bkl,ok->bol", patches**2, w_flat**2)
+            if b_enc is not None:
+                s = s + (1.0 - b_enc**2).reshape(1, -1, 1)
+        else:
+            s = torch.einsum("bkl,ok->bol", patches, w_flat) - torch.einsum(
+                "bkl,ok->bol", patches**2, w_flat**2
+            )
+            if b_enc is not None:
+                s = s + (b_enc * (1.0 - b_enc)).reshape(1, -1, 1)
+    return s / (k * k)
 
 
 class SCLinear(nn.Module):
@@ -122,11 +171,17 @@ class SCLinear(nn.Module):
         )
         k = self.fan_in
         out_val = x_val @ w.t()
+        b_enc: Tensor | None = None
         if self.bias is not None:
-            b = clamp_ste(self.bias, cfg.encoding)
-            out_val = out_val + x_scale * b
+            # The bias register is programmed in the incoming scale, then
+            # encoded: clamp AFTER scaling, matching the exact path.
+            b_enc = clamp_ste(x_scale * self.bias, cfg.encoding)
+            out_val = out_val + b_enc
         out_val = out_val / k
-        out_val = _apply_noise(out_val, cfg, self.training)
+        term_var_sum: Tensor | None = None
+        if cfg.accumulator == "apc" and cfg.noise and self.training:
+            term_var_sum = _apc_term_var_sum(x_val, w, b_enc, k, cfg)
+        out_val = _apply_noise(out_val, cfg, self.training, term_var_sum)
         out = SCNumber(out_val, cfg, scale=x_scale / k, corr_id=self.output_corr_id)
         if self.decode_output:
             from scgrad.encoding import decode
@@ -241,12 +296,20 @@ class SCConv2d(nn.Module):
         )
         k = self.fan_in
         out_val = torch.einsum("bkl,ok->bol", patches, w_flat)
+        b_enc: Tensor | None = None
         if self.bias is not None:
-            b = clamp_ste(self.bias, cfg.encoding)
-            out_val = out_val + (x_scale * b).reshape(1, -1, 1)
+            # Bias register programmed in the incoming scale, then encoded
+            # (clamp after scaling), matching the exact path.
+            b_enc = clamp_ste(x_scale * self.bias, cfg.encoding)
+            out_val = out_val + b_enc.reshape(1, -1, 1)
         out_val = out_val / k
+        term_var_sum: Tensor | None = None
+        if cfg.accumulator == "apc" and cfg.noise and self.training:
+            term_var_sum = _apc_term_var_sum_conv(patches, w_flat, b_enc, k, cfg).reshape(
+                batch, self.out_channels, out_h, out_w
+            )
         out_val = out_val.reshape(batch, self.out_channels, out_h, out_w)
-        out_val = _apply_noise(out_val, cfg, self.training)
+        out_val = _apply_noise(out_val, cfg, self.training, term_var_sum)
         out = SCNumber(out_val, cfg, scale=x_scale / k, corr_id=self.output_corr_id)
         if self.decode_output:
             from scgrad.encoding import decode
@@ -275,12 +338,14 @@ def sc_relu(s: SCNumber) -> SCNumber:
     ReLU is positively homogeneous, so applying it to the scaled physical
     value equals applying it to the descaled value and rescaling: the
     scale carries through unchanged and no decode/clamp round-trip is
-    needed. The result is a regenerated stream (fresh corr_id), matching
-    the exact path, which counts the value, applies ReLU digitally, and
-    re-encodes. Acceptable v0.1 activation treatment, documented in
-    docs/design_notes.md; SC-native activation circuits are future work.
+    needed. The corr_id also carries through: ReLU is a digital-domain
+    operation on the counted value, upstream of the producing layer's
+    output SNG, so the stream identity it flows on is unchanged (the
+    exact path does the same). Acceptable v0.1 activation treatment,
+    documented in docs/design_notes.md; SC-native activation circuits
+    are future work.
     """
-    return SCNumber(torch.relu(s.value), s.config, scale=s.scale)
+    return SCNumber(torch.relu(s.value), s.config, scale=s.scale, corr_id=s.corr_id)
 
 
 class SCReLU(nn.Module):
