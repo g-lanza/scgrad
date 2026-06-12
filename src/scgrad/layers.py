@@ -1,0 +1,290 @@
+"""Drop-in PyTorch layers built from the SC primitives.
+
+Both layers compute, in closed form, exactly what the elementwise
+primitive graph (sc_mul per product, sc_add_tree over the fan-in)
+computes in expectation: the products collapse to a matmul and the
+uniform MUX accumulation to a division by the fan-in k. The collapsed
+form is one tensor op, GPU-friendly, and is tested for equivalence
+against the elementwise primitives in tests/test_layers.py.
+
+Scale behavior (stated per the architecture contract): with input scale
+s_in and fan-in k (in_features, plus one for the bias term when
+present), the output value is the physical MUX result
+(x @ W.T + s_in * b) / k and the output scale is s_in / k. The encoded
+bias is pre-scaled by s_in so every MUX term carries the same factor,
+which keeps decode(descale=True) an exact recovery of x @ W.T + b; this
+mirrors programming a hardware bias register in the incoming scale.
+
+Correlation identities: each layer owns persistent port ids (input,
+weight, bias, output), allocated at construction, the way SNGs are fixed
+silicon at each port. Layer outputs are regenerated streams (count, then
+re-encode through the output port SNG), the standard decorrelation
+practice; partial correlation propagation through op outputs is
+deliberately not modeled in v0.1 (see docs/design_notes.md).
+
+Training noise: with config.noise set, layers inject the analytic
+counting noise of a length-N stream (accuracy.sc_noise_std) into their
+output during training, reparameterized with a detached standard
+deviation. This is how the optimizer feels finite stream length: after
+descaling, the noise is k times larger, which is precisely the SC
+signal-to-noise cost of deep fan-in.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+from torch import Tensor, nn
+
+from scgrad.accuracy import sc_noise_std
+from scgrad.correlation import record_multiply
+from scgrad.encoding import (
+    SCConfig,
+    SCEncodingError,
+    SCNumber,
+    clamp_ste,
+    fresh_corr_id,
+)
+
+
+def _apply_noise(value: Tensor, config: SCConfig, training: bool) -> Tensor:
+    """Inject analytic SC counting noise during training (reparameterized)."""
+    if not (config.noise and training):
+        return value
+    std = sc_noise_std(value.detach(), config.length, config.encoding)
+    noisy = value + std * torch.randn_like(value)
+    return clamp_ste(noisy, config.encoding)
+
+
+class SCLinear(nn.Module):
+    """SC linear layer: XNOR/AND multiplies accumulated by a uniform MUX.
+
+    Mirrors nn.Linear: float weight/bias Parameters trained normally,
+    clamped into the encoding range (straight-through) when encoded each
+    forward. forward is the approximate (training) path; the exact path
+    in eval_exact.py replays the same circuit on real bitstreams using
+    this layer's port ids. Returns an SCNumber, or the descaled tensor
+    when decode_output is set.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        config: SCConfig | None = None,
+        decode_output: bool = False,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.config = config if config is not None else SCConfig()
+        self.decode_output = decode_output
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias: nn.Parameter | None
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.bias = None
+        self.reset_parameters()
+        self.input_corr_id = fresh_corr_id()
+        self.weight_corr_id = fresh_corr_id()
+        self.bias_corr_id = fresh_corr_id()
+        self.output_corr_id = fresh_corr_id()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            bound = 1.0 / math.sqrt(self.in_features)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    @property
+    def fan_in(self) -> int:
+        """MUX fan-in k: in_features plus one for the bias term."""
+        return self.in_features + (1 if self.bias is not None else 0)
+
+    def forward(self, x: Tensor | SCNumber) -> SCNumber | Tensor:
+        cfg = self.config
+        if isinstance(x, SCNumber):
+            if x.config.encoding != cfg.encoding:
+                raise SCEncodingError(
+                    f"layer encoding {cfg.encoding} got input encoding {x.config.encoding}"
+                )
+            x_val, x_scale, x_id = x.value, x.scale, x.corr_id
+        else:
+            x_val = clamp_ste(x, cfg.encoding)
+            x_scale, x_id = 1.0, self.input_corr_id
+        w = clamp_ste(self.weight, cfg.encoding)
+        record_multiply(
+            SCNumber(x_val.unsqueeze(-2), cfg, scale=x_scale, corr_id=x_id),
+            SCNumber(w, cfg, scale=1.0, corr_id=self.weight_corr_id),
+        )
+        k = self.fan_in
+        out_val = x_val @ w.t()
+        if self.bias is not None:
+            b = clamp_ste(self.bias, cfg.encoding)
+            out_val = out_val + x_scale * b
+        out_val = out_val / k
+        out_val = _apply_noise(out_val, cfg, self.training)
+        out = SCNumber(out_val, cfg, scale=x_scale / k, corr_id=self.output_corr_id)
+        if self.decode_output:
+            from scgrad.encoding import decode
+
+            return decode(out, descale=True)
+        return out
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}, N={self.config.length}, "
+            f"encoding={self.config.encoding}, scale=1/{self.fan_in}"
+        )
+
+
+class SCConv2d(nn.Module):
+    """SC 2d convolution via im2col: the SCLinear circuit over each patch.
+
+    Matches the nn.Conv2d signature for stride, padding, and dilation;
+    grouped convolution is not part of the v0.1 circuit (groups must be
+    1). MUX fan-in is in_channels * kernel_height * kernel_width, plus
+    one for the bias term; scale behavior is identical to SCLinear with
+    that fan-in.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | tuple[int, int],
+        stride: int | tuple[int, int] = 1,
+        padding: int | tuple[int, int] = 0,
+        dilation: int | tuple[int, int] = 1,
+        groups: int = 1,
+        bias: bool = True,
+        config: SCConfig | None = None,
+        decode_output: bool = False,
+    ) -> None:
+        super().__init__()
+        if groups != 1:
+            raise SCEncodingError("SCConv2d supports groups=1 only")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = _pair(kernel_size)
+        self.stride = _pair(stride)
+        self.padding = _pair(padding)
+        self.dilation = _pair(dilation)
+        self.config = config if config is not None else SCConfig()
+        self.decode_output = decode_output
+        kh, kw = self.kernel_size
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kh, kw))
+        self.bias: nn.Parameter | None
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.bias = None
+        self.reset_parameters()
+        self.input_corr_id = fresh_corr_id()
+        self.weight_corr_id = fresh_corr_id()
+        self.bias_corr_id = fresh_corr_id()
+        self.output_corr_id = fresh_corr_id()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            kh, kw = self.kernel_size
+            bound = 1.0 / math.sqrt(self.in_channels * kh * kw)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    @property
+    def fan_in(self) -> int:
+        """MUX fan-in k: patch size plus one for the bias term."""
+        kh, kw = self.kernel_size
+        return self.in_channels * kh * kw + (1 if self.bias is not None else 0)
+
+    def output_size(self, h: int, w: int) -> tuple[int, int]:
+        """Spatial output size for an input of height h and width w."""
+        kh, kw = self.kernel_size
+        sh, sw = self.stride
+        ph, pw = self.padding
+        dh, dw = self.dilation
+        out_h = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+        out_w = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+        return out_h, out_w
+
+    def forward(self, x: Tensor | SCNumber) -> SCNumber | Tensor:
+        cfg = self.config
+        if isinstance(x, SCNumber):
+            if x.config.encoding != cfg.encoding:
+                raise SCEncodingError(
+                    f"layer encoding {cfg.encoding} got input encoding {x.config.encoding}"
+                )
+            x_val, x_scale = x.value, x.scale
+            x_id = x.corr_id
+        else:
+            x_val = clamp_ste(x, cfg.encoding)
+            x_scale, x_id = 1.0, self.input_corr_id
+        batch, _, h, w = x_val.shape
+        out_h, out_w = self.output_size(h, w)
+        patches = nn.functional.unfold(
+            x_val,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+        )
+        w_enc = clamp_ste(self.weight, cfg.encoding)
+        w_flat = w_enc.reshape(self.out_channels, -1)
+        record_multiply(
+            SCNumber(patches.transpose(1, 2).unsqueeze(-2), cfg, scale=x_scale, corr_id=x_id),
+            SCNumber(w_flat, cfg, scale=1.0, corr_id=self.weight_corr_id),
+        )
+        k = self.fan_in
+        out_val = torch.einsum("bkl,ok->bol", patches, w_flat)
+        if self.bias is not None:
+            b = clamp_ste(self.bias, cfg.encoding)
+            out_val = out_val + (x_scale * b).reshape(1, -1, 1)
+        out_val = out_val / k
+        out_val = out_val.reshape(batch, self.out_channels, out_h, out_w)
+        out_val = _apply_noise(out_val, cfg, self.training)
+        out = SCNumber(out_val, cfg, scale=x_scale / k, corr_id=self.output_corr_id)
+        if self.decode_output:
+            from scgrad.encoding import decode
+
+            return decode(out, descale=True)
+        return out
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_channels={self.in_channels}, out_channels={self.out_channels}, "
+            f"kernel_size={self.kernel_size}, stride={self.stride}, "
+            f"padding={self.padding}, bias={self.bias is not None}, "
+            f"N={self.config.length}, encoding={self.config.encoding}, scale=1/{self.fan_in}"
+        )
+
+
+def _pair(v: int | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(v, tuple):
+        return v
+    return (v, v)
+
+
+def sc_relu(s: SCNumber) -> SCNumber:
+    """ReLU between SC layers, applied in the decoded domain.
+
+    ReLU is positively homogeneous, so applying it to the scaled physical
+    value equals applying it to the descaled value and rescaling: the
+    scale carries through unchanged and no decode/clamp round-trip is
+    needed. The result is a regenerated stream (fresh corr_id), matching
+    the exact path, which counts the value, applies ReLU digitally, and
+    re-encodes. Acceptable v0.1 activation treatment, documented in
+    docs/design_notes.md; SC-native activation circuits are future work.
+    """
+    return SCNumber(torch.relu(s.value), s.config, scale=s.scale)
+
+
+class SCReLU(nn.Module):
+    """Module wrapper around sc_relu for use inside nn.Sequential."""
+
+    def forward(self, x: SCNumber) -> SCNumber:
+        return sc_relu(x)

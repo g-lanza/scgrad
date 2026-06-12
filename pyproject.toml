@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scgrad"
+version = "0.1.0"
+description = "Differentiable stochastic-computing primitives for PyTorch: train neural networks natively SC-aware."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "g-lanza", email = "95wb9zp7jt@privaterelay.appleid.com" }]
+keywords = ["stochastic computing", "pytorch", "energy-based models", "bitstream", "differentiable"]
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+gui = ["textual>=0.80", "plotext>=5.2"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "hypothesis>=6.100",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "torchvision>=0.17",
+]
+
+[project.scripts]
+scgrad-gui = "scgrad.gui.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scgrad"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "NPY", "RUF"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["plotext", "plotext.*", "torchvision", "torchvision.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

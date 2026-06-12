@@ -1,0 +1,6 @@
+#!/bin/sh
+# Strip any AI co-authorship / generation trailers from commit messages.
+msg_file="$1"
+grep -ivE 'co-authored-by:.*(claude|anthropic|noreply@anthropic)' "$msg_file" \
+  | grep -ivE 'generated with .*claude|generated|created with claude' \
+  > "$msg_file.tmp" && mv "$msg_file.tmp" "$msg_file"
