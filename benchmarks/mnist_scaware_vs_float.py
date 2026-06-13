@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
@@ -127,7 +127,40 @@ def _train_sc_aware(train_loader: DataLoader, config: SCConfig, epochs: int) -> 
             opt.zero_grad()
             loss.backward()
             opt.step()
+        # Train against the deployed circuit: refresh the gain registers
+        # from current activations each epoch (that is what SC-aware
+        # means). The baseline gets the same calibration post-training.
+        calibrate_gains(model, train_loader)
+        model.train()
     return model
+
+
+def calibrate_gains(model: nn.Sequential, loader: DataLoader, n_batches: int = 2) -> None:
+    """Set per-layer binary-domain output gains from real activation ranges.
+
+    Counteracts the 1/fan_in dynamic-range loss of scaled accumulation,
+    the standard scaling practice in SC accelerator designs. Applied
+    identically to both contenders after training: gains are a property
+    of the deployed circuit, not of the training method, so neither side
+    gets an advantage from them.
+    """
+    model.eval()
+    xs = [x for i, (x, _) in enumerate(loader) if i < n_batches]
+    batch = torch.cat(xs)
+    with torch.no_grad():
+        cur: Tensor | SCNumber = batch
+        for layer in model:
+            if isinstance(layer, SCLinear):
+                layer.output_gain = 1.0
+                out = layer(cur)
+                assert isinstance(out, SCNumber)
+                q = float(torch.quantile(out.value.abs().flatten(), 0.995).item())
+                layer.output_gain = max(1.0, 0.95 / max(q, 1e-9))
+                out = layer(cur)
+                assert isinstance(out, SCNumber)
+                cur = out
+            else:
+                cur = layer(cur)
 
 
 def _config(length: int, n_rngs: int | None, noise: bool) -> SCConfig:
@@ -160,6 +193,7 @@ def _rebudget(model: nn.Sequential, config: SCConfig) -> nn.Sequential:
             d.weight_corr_id = s.weight_corr_id
             d.bias_corr_id = s.bias_corr_id
             d.output_corr_id = s.output_corr_id
+            d.output_gain = s.output_gain
     return out
 
 
@@ -186,12 +220,14 @@ def main() -> None:
     sc_model = _train_sc_aware(train_loader, train_cfg, epochs)
     sc_float_acc = evaluate_float(sc_model, test_loader)["accuracy"]
     print(f"SC-aware model float-forward accuracy (subset): {sc_float_acc:.4f}")
+    calibrate_gains(sc_model, train_loader)
 
     rows: list[tuple[str, int, str, float]] = []
     for n_rngs in RNG_BUDGETS:
         for length in EVAL_LENGTHS:
             cfg = _config(length, n_rngs, noise=False)
             mapped = map_float_to_sc(float_model, cfg)
+            calibrate_gains(mapped, train_loader)
             acc_a = evaluate_exact(mapped, test_loader, cfg)["accuracy"]
             budget = "unbounded" if n_rngs is None else str(n_rngs)
             rows.append(("float-then-map", length, budget, acc_a))
@@ -269,7 +305,11 @@ def _write_results(
         f"(Total benchmark wall time: {elapsed:.0f} s. The rng budget of 2 forces the",
         "second layer's activation and weight streams onto the same physical",
         "generator: the correlated-multiply regime the correlation penalty exists",
-        "for. The unbounded budget gives every port its own generator.)",
+        "for. The unbounded budget gives every port its own generator. Both models",
+        "receive identical post-training per-layer output-gain calibration (the",
+        "standard SC dynamic-range scaling practice), so neither side wins by the",
+        "other being starved of dynamic range. Accumulation is APC, as in published",
+        "SC accelerators; single seed, single run, CPU.)",
         "",
     ]
     RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)

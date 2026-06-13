@@ -182,6 +182,14 @@ def _linear_stage_value(
     return p_hat if config.encoding == "unipolar" else 2.0 * p_hat - 1.0
 
 
+def _apply_gain(value: Tensor, gain: float, config: SCConfig) -> Tensor:
+    """Binary-domain output gain with range saturation (mirrors layers)."""
+    if gain == 1.0:
+        return value
+    lo, hi = _enc_range(config)
+    return (value * gain).clamp(lo, hi)
+
+
 def _exact_linear(state: _ExactState, layer: SCLinear, config: SCConfig) -> _ExactState:
     w = layer.weight.detach().clamp(*_enc_range(config))
     bias = None
@@ -197,7 +205,8 @@ def _exact_linear(state: _ExactState, layer: SCLinear, config: SCConfig) -> _Exa
         layer.bias_corr_id,
         layer.output_corr_id,
     )
-    return _ExactState(value, state.scale / layer.fan_in, layer.output_corr_id)
+    value = _apply_gain(value, layer.output_gain, config)
+    return _ExactState(value, state.scale * layer.output_gain / layer.fan_in, layer.output_corr_id)
 
 
 def _exact_conv(state: _ExactState, layer: SCConv2d, config: SCConfig) -> _ExactState:
@@ -228,7 +237,8 @@ def _exact_conv(state: _ExactState, layer: SCConv2d, config: SCConfig) -> _Exact
     )
     value = value.reshape(batch, n_loc, layer.out_channels).transpose(1, 2)
     value = value.reshape(batch, layer.out_channels, out_h, out_w)
-    return _ExactState(value, state.scale / layer.fan_in, layer.output_corr_id)
+    value = _apply_gain(value, layer.output_gain, config)
+    return _ExactState(value, state.scale * layer.output_gain / layer.fan_in, layer.output_corr_id)
 
 
 def _enc_range(config: SCConfig) -> tuple[float, float]:

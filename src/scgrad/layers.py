@@ -141,6 +141,13 @@ class SCLinear(nn.Module):
         self.weight_corr_id = fresh_corr_id()
         self.bias_corr_id = fresh_corr_id()
         self.output_corr_id = fresh_corr_id()
+        # Binary-domain gain register applied to the counted output before
+        # re-encoding (a fixed-point multiply on hardware). Counteracts the
+        # 1/fan_in dynamic-range loss of scaled accumulation; values that
+        # leave the encoding range saturate, in both paths. Standard
+        # practice in SC accelerators; calibrate per layer on real
+        # activations (see benchmarks/mnist_scaware_vs_float.py).
+        self.output_gain: float = 1.0
 
     def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
@@ -182,7 +189,14 @@ class SCLinear(nn.Module):
         if cfg.accumulator == "apc" and cfg.noise and self.training:
             term_var_sum = _apc_term_var_sum(x_val, w, b_enc, k, cfg)
         out_val = _apply_noise(out_val, cfg, self.training, term_var_sum)
-        out = SCNumber(out_val, cfg, scale=x_scale / k, corr_id=self.output_corr_id)
+        if self.output_gain != 1.0:
+            out_val = clamp_ste(out_val * self.output_gain, cfg.encoding)
+        out = SCNumber(
+            out_val,
+            cfg,
+            scale=x_scale * self.output_gain / k,
+            corr_id=self.output_corr_id,
+        )
         if self.decode_output:
             from scgrad.encoding import decode
 
@@ -193,7 +207,8 @@ class SCLinear(nn.Module):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, N={self.config.length}, "
-            f"encoding={self.config.encoding}, scale=1/{self.fan_in}"
+            f"encoding={self.config.encoding}, scale=1/{self.fan_in}, "
+            f"gain={self.output_gain:g}"
         )
 
 
@@ -243,6 +258,8 @@ class SCConv2d(nn.Module):
         self.weight_corr_id = fresh_corr_id()
         self.bias_corr_id = fresh_corr_id()
         self.output_corr_id = fresh_corr_id()
+        # Binary-domain gain register; see SCLinear.output_gain.
+        self.output_gain: float = 1.0
 
     def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
@@ -310,7 +327,14 @@ class SCConv2d(nn.Module):
             )
         out_val = out_val.reshape(batch, self.out_channels, out_h, out_w)
         out_val = _apply_noise(out_val, cfg, self.training, term_var_sum)
-        out = SCNumber(out_val, cfg, scale=x_scale / k, corr_id=self.output_corr_id)
+        if self.output_gain != 1.0:
+            out_val = clamp_ste(out_val * self.output_gain, cfg.encoding)
+        out = SCNumber(
+            out_val,
+            cfg,
+            scale=x_scale * self.output_gain / k,
+            corr_id=self.output_corr_id,
+        )
         if self.decode_output:
             from scgrad.encoding import decode
 
@@ -322,7 +346,8 @@ class SCConv2d(nn.Module):
             f"in_channels={self.in_channels}, out_channels={self.out_channels}, "
             f"kernel_size={self.kernel_size}, stride={self.stride}, "
             f"padding={self.padding}, bias={self.bias is not None}, "
-            f"N={self.config.length}, encoding={self.config.encoding}, scale=1/{self.fan_in}"
+            f"N={self.config.length}, encoding={self.config.encoding}, scale=1/{self.fan_in}, "
+            f"gain={self.output_gain:g}"
         )
 
 
