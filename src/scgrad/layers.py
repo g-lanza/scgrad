@@ -378,3 +378,33 @@ class SCReLU(nn.Module):
 
     def forward(self, x: SCNumber) -> SCNumber:
         return sc_relu(x)
+
+
+def sc_flatten(s: SCNumber, start_dim: int = 1) -> SCNumber:
+    """Flatten an SCNumber's value tensor from start_dim, preserving metadata.
+
+    A reshape is wiring, not arithmetic: it relabels which physical wire
+    carries which value and changes neither the values, the scale, nor
+    the stream identity. The exact path flattens the raw value tensor
+    identically (it carries no SCNumber across nn.Flatten), so the two
+    paths agree.
+    """
+    return SCNumber(s.value.flatten(start_dim), s.config, scale=s.scale, corr_id=s.corr_id)
+
+
+class SCFlatten(nn.Module):
+    """SC-aware flatten between a convolutional stage and a linear stage.
+
+    Use this in an nn.Sequential instead of nn.Flatten when the tensor in
+    flight is an SCNumber (the approximate/training path). The exact path
+    accepts a plain nn.Flatten because it threads raw tensors, so a model
+    built for both paths places SCFlatten here and exact_forward treats it
+    the same as nn.Flatten.
+    """
+
+    def __init__(self, start_dim: int = 1) -> None:
+        super().__init__()
+        self.start_dim = start_dim
+
+    def forward(self, x: SCNumber) -> SCNumber:
+        return sc_flatten(x, self.start_dim)

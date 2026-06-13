@@ -251,21 +251,41 @@ def _verdict(rows: list[tuple[str, int, str, float]]) -> tuple[bool, str]:
             b = by_key[("sc-aware", length, budget)]
             wins.append(b >= a)
     short_n_wins = wins[0] and wins[2]
-    if all(wins):
+    chance = 1.0 / 10 * 1.5
+    collapse_note = ""
+    for n_rngs in RNG_BUDGETS:
+        if n_rngs is None:
+            continue
+        budget = str(n_rngs)
+        if all(
+            by_key[(m, length, budget)] < chance
+            for m in ("float-then-map", "sc-aware")
+            for length in EVAL_LENGTHS
+        ):
+            collapse_note = (
+                f" At the {budget}-generator budget both methods collapse to chance: "
+                "sharing one randomness source across a whole layer's activation and "
+                "weight streams replaces the inner product with a distance-like "
+                "function that neither training method in this benchmark survives "
+                "(see docs/design_notes.md); that condition is reported as the "
+                "honest limit of the correlation penalty, not as a win."
+            )
+    if all(wins) and not collapse_note:
         return True, (
             "SC-aware training matches or beats float-then-map at every evaluated "
             "stream length and randomness budget. The thesis holds on this benchmark."
         )
     if short_n_wins:
         return True, (
-            "SC-aware training matches or beats float-then-map at the short stream "
-            "length (N=256) under both randomness budgets, which is the regime the "
-            "thesis is about. The thesis holds on this benchmark."
+            "SC-aware training beats float-then-map at the short stream length "
+            "(N=256) with independent generators, which is the regime the thesis "
+            "is about; at N=1024 the float-then-map model's higher float ceiling "
+            "wins, the expected trade." + collapse_note
         )
     return False, (
         "SC-aware training did NOT beat float-then-map at short stream lengths on "
         "this benchmark. This is a negative result and is reported as such; the "
-        "value of the EBM substrate (Phase 2) does not depend on it."
+        "value of the EBM substrate (Phase 2) does not depend on it." + collapse_note
     )
 
 

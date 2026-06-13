@@ -257,6 +257,62 @@ across a grid of stream lengths. If the two paths ever silently diverge, the
 training path is optimizing a fiction; the test exists so that failure is loud.
 It is the library's conscience.
 
+## 9. The energy-based-model bridge (Phase 2)
+
+The same `SCNumber` primitives extend to energy-based models. An Ising layer
+(`ebm.py`) defines an energy over bipolar spins $s \in \{-1, +1\}^n$,
+
+$$E(s) = -\tfrac{1}{2}\, s^\top J s - h^\top s,$$
+
+with the coupling matrix $J$ held symmetric and zero-diagonal (constructed
+from a raw parameter as $\tfrac{1}{2}(R + R^\top)$ minus its diagonal, so the
+gradient respects the constraint instead of fighting it) and the field $h$ a
+free parameter. The Boltzmann distribution at inverse temperature $\beta$ is
+$\pi(s) \propto e^{-\beta E(s)}$.
+
+**Gibbs sampling on bitstreams.** Single-site Gibbs flips spin $i$ to $+1$
+with the conditional probability
+
+$$p(s_i = +1 \mid s_{\neq i}) = \sigma\!\big(2\beta\,(J_i \cdot s + h_i)\big),$$
+
+where $\sigma$ is the logistic function. This is exactly an SNG: a comparator
+bit $\mathbb{1}[r < p]$ against a `hardware.py` uniform $r$ is a Bernoulli draw
+with probability $p$, so each spin update *is* one stochastic-computing bit
+whose probability is set by the local field. This is the p-bit picture, and the
+randomness obeys the same seeding, reproducibility, and `n_rngs` budget
+semantics as every other stream in the library. A systematic scan over all
+sites, vectorized across chains, leaves $\pi$ invariant (each conditional
+update satisfies detailed balance for $\pi$, and the composition of
+$\pi$-invariant kernels is $\pi$-invariant), so the chain converges to the
+Boltzmann distribution; `tests/test_ebm.py` checks the empirical distribution
+against the analytic $\pi$ on a four-spin system within total-variation 0.08.
+
+**Contrastive divergence.** Maximum-likelihood training of an EBM needs the
+gradient $\partial_\theta \mathbb{E}_{\text{data}}[E] -
+\partial_\theta \mathbb{E}_{\pi}[E]$, whose second term requires samples from
+$\pi$. CD-$k$ (Hinton 2002) approximates $\mathbb{E}_\pi$ by $k$ Gibbs steps
+started from the data. `contrastive_divergence` returns the scalar
+$\mathbb{E}_{\text{data}}[E] - \mathbb{E}_{\text{neg}}[E]$ with the negative
+samples detached, so its gradient with respect to $\theta$ is precisely the
+CD-$k$ gradient. Song & Kingma (2021) survey the wider family of EBM training
+methods this sits in.
+
+**Chain independence.** Distinct chains, and distinct sites within a chain,
+draw from distinct generator ids; chains sharing a generator would coalesce
+(identical randomness plus identical kernels evolve identically), so ensemble
+statistics require independent streams. A finite `n_rngs` correlating chains is
+then a faithful model of a shared hardware RNG, not a defect.
+
+**Honest positioning.** This is a software prototyping substrate, not a
+hardware claim. The adjacent tools on the energy-based-sampling frontier —
+THRML (Extropic) and thermox (Normal Computing) — are JAX and operate on spins
+or Ornstein–Uhlenbeck processes close to a hardware story; scgrad's
+contribution is the PyTorch-native, Gaines-lineage *bitstream* counterpart that
+reuses the SC multiply/add/sample primitives directly. Where Extropic's
+system-level energy figures (on the order of a $10^4\times$ projection) are
+mentioned, they are simulation projections, not measured silicon, and are
+labelled as such.
+
 ## References
 
 - B. R. Gaines, "Stochastic computing," Spring Joint Computer Conference, 1967.

@@ -14,9 +14,11 @@ across whole tensors with no per-element Python loops. Counts stay below
 2^24, exact in float32.
 
 Models must be nn.Sequential pipelines of SCLinear / SCConv2d /
-SCReLU / nn.ReLU / nn.Flatten. The approximate and exact paths share
-the layer port ids, so the randomness-budget structure (SCConfig.n_rngs)
-is identical in both.
+SCReLU / nn.ReLU / SCFlatten / nn.Flatten. The approximate and exact
+paths share the layer port ids, so the randomness-budget structure
+(SCConfig.n_rngs) is identical in both. Use SCFlatten (not nn.Flatten)
+between a conv stage and a linear stage so the approximate path can carry
+an SCNumber across the reshape; the exact path treats both identically.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from torch import Tensor, nn
 
 from scgrad.encoding import SCConfig, SCEncodingError, SCNumber, value_to_probability
 from scgrad.hardware import BitstreamSource, make_source
-from scgrad.layers import SCConv2d, SCLinear, SCReLU
+from scgrad.layers import SCConv2d, SCFlatten, SCLinear, SCReLU
 
 _CHUNK = 256
 
@@ -270,6 +272,8 @@ def exact_forward(model: nn.Sequential, x: Tensor, config: SCConfig) -> SCNumber
             state = _exact_conv(state, layer, config)
         elif isinstance(layer, (SCReLU, nn.ReLU)):
             state = _ExactState(torch.relu(state.value), state.scale, state.corr_id)
+        elif isinstance(layer, SCFlatten):
+            state = _ExactState(state.value.flatten(layer.start_dim), state.scale, state.corr_id)
         elif isinstance(layer, nn.Flatten):
             state = _ExactState(layer(state.value), state.scale, state.corr_id)
         else:

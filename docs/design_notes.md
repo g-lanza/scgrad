@@ -109,6 +109,38 @@ time (and, for APC, across terms) is a matmul over the flattened
 (term, time) axis; counts stay below 2^24 and are exact in float32.
 Blocked over time chunks and batch rows to bound memory.
 
+## What the benchmark actually showed
+
+Three-epoch run, 2000 test images, identical circuits, identical gain
+calibration (docs/RESULTS.md has the table). At N = 256 with independent
+generators, SC-aware training reaches 0.836 against the float-then-map
+0.466: the noise injection is doing the work, and the SC-aware model
+nearly attains its own float ceiling (0.871) at a quarter of the stream
+length the baseline needs. At N = 1024 the baseline's higher float
+ceiling (0.943) wins — SC-aware training trades peak float accuracy for
+robustness, which is the correct trade exactly when N is short, and
+short N is the point of SC. At a 2-generator budget both collapse to
+chance: sharing one RNS across a layer's activation and weight tensors
+replaces every product with the correlated closed form (a distance, not
+a product), and no penalty recovers an inner product that the hardware
+no longer computes. The honest fix is a correlation-aware forward that
+trains through the correlated closed form instead of penalizing it —
+noted as future work, not attempted in v0.1.
+
+## EBM substrate decisions (Phase 2)
+
+Chains get one generator id per (chain, spin) site: shared randomness
+plus identical kernels coalesce chains, so ensemble statistics need
+distinct streams; a finite rng budget correlating chains is then a
+modeling feature, not a bug. The Sobol fast path draws all site columns
+from one engine in a single pass — a Sobol dimension's values do not
+depend on the engine's total dimension, so this is exactly equal to
+per-site uniforms() calls. CD training passes id_offset per step so the
+negative phase does not reuse one fixed noise sequence every step.
+Verified against ground truth: 4-spin empirical distribution within
+TV = 0.036 of the analytic Boltzmann distribution; CD-1 recovers a
+planted spin-pair coupling.
+
 ## Toolchain notes
 
 mypy strict with torch needs a handful of targeted

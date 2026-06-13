@@ -21,9 +21,9 @@ Float32 reference accuracy (subset): 0.9425 (baseline model), 0.8705 (SC-aware m
 
 ## Verdict
 
-SC-aware training matches or beats float-then-map at the short stream length (N=256) under both randomness budgets, which is the regime the thesis is about. The thesis holds on this benchmark.
+SC-aware training beats float-then-map at the short stream length (N=256) with independent generators, which is the regime the thesis is about; at N=1024 the float-then-map model's higher float ceiling wins, the expected trade. At the 2-generator budget both methods collapse to chance: sharing one randomness source across a whole layer's activation and weight streams replaces the inner product with a distance-like function that neither training method in this benchmark survives (see docs/design_notes.md); that condition is reported as the honest limit of the correlation penalty, not as a win.
 
-(Total benchmark wall time: 114 s. The rng budget of 2 forces the
+(Total benchmark wall time: 145 s. The rng budget of 2 forces the
 second layer's activation and weight streams onto the same physical
 generator: the correlated-multiply regime the correlation penalty exists
 for. The unbounded budget gives every port its own generator. Both models
