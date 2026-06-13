@@ -147,3 +147,20 @@ mypy strict with torch needs a handful of targeted
 `# type: ignore[no-untyped-call]` comments (Function.apply, SobolEngine,
 fast_forward, Tensor.backward) — these are torch's typing gaps, never
 ours; no module-level ignores for first-party code.
+
+## Sign-off status
+
+Both phases are green end to end. The full suite is 143 tests across
+encoding, hardware, ops (float64 gradcheck gate), accuracy, correlation,
+layers, the dual-path invariant, property-based checks, APC, the
+conv/flatten/linear pipeline, the EBM, and the GUI smoke test; ruff and
+mypy strict are clean across the tree. The package builds a wheel that
+installs and imports in a fresh venv. All three examples run start to
+finish, the GUI renders headless with live data, and the MNIST thesis
+benchmark populates RESULTS.md with the measured verdict. The git history
+is free of any AI attribution. Tagged v0.1.0 (Phase 1) and v0.2.0
+(Phase 2). Remaining honest gaps, all documented above: partial-
+correlation propagation through op outputs is not modeled; activations
+are computed in the decoded domain; the shared-RNS collapse regime is
+reported, not solved (a correlation-aware forward is the future-work
+fix).
