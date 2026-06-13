@@ -2,9 +2,11 @@
 
 A compact version of the thesis benchmark: one SC model trained through
 scgrad's differentiable SC forward (counting noise plus correlation
-penalty), then scored on the bit-accurate exact path. Uses a training
-subset so it finishes in a couple of minutes on CPU; the full comparison
-against float-then-map lives in benchmarks/mnist_scaware_vs_float.py.
+penalty), with per-layer output-gain calibration so the physical values
+keep their dynamic range, then scored on the bit-accurate exact path.
+Uses a training subset so it finishes in a couple of minutes on CPU; the
+full comparison against float-then-map lives in
+benchmarks/mnist_scaware_vs_float.py.
 
 Run: uv run python examples/02_train_mnist_scaware.py
 """
@@ -34,7 +36,6 @@ config = SCConfig(
     length=256,
     source="sobol",
     seed=5,
-    n_rngs=2,
     noise=True,
     accumulator="apc",
 )
@@ -59,8 +60,32 @@ model = nn.Sequential(
 )
 opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-model.train()
+
+def calibrate_gains() -> None:
+    """Set each SC layer's output gain from its activation range.
+
+    Counteracts the 1/fan_in attenuation of scaled accumulation so the
+    physical logits keep their dynamic range; the same calibration the
+    deployed circuit would carry.
+    """
+    model.eval()
+    x = next(iter(train_loader))[0]
+    with torch.no_grad():
+        cur: object = x
+        for layer in model:
+            if isinstance(layer, SCLinear):
+                layer.output_gain = 1.0
+                probe = layer(cur)
+                assert isinstance(probe, SCNumber)
+                q = float(torch.quantile(probe.value.abs().flatten(), 0.995).item())
+                layer.output_gain = max(1.0, 0.95 / max(q, 1e-9))
+                cur = layer(cur)
+            else:
+                cur = layer(cur)
+
+
 for epoch in range(2):
+    model.train()
     for step, (x, y) in enumerate(train_loader):
         with CorrelationTracker() as tracker:
             out = model(x)
@@ -74,18 +99,14 @@ for epoch in range(2):
         opt.step()
         if step % 50 == 0:
             print(f"epoch {epoch} step {step:3d}  task {task.item():.4f}  corr {corr.item():.4f}")
+    calibrate_gains()
 
 float_acc = evaluate_float(model, test_loader)["accuracy"]
 print(f"\nfloat-forward accuracy ({EVAL_IMAGES} test images): {float_acc:.4f}")
 
 for length in (256, 1024):
     eval_cfg = SCConfig(
-        encoding="bipolar",
-        length=length,
-        source="sobol",
-        seed=5,
-        n_rngs=2,
-        accumulator="apc",
+        encoding="bipolar", length=length, source="sobol", seed=5, accumulator="apc"
     )
     exact_acc = evaluate_exact(model, test_loader, eval_cfg)["accuracy"]
-    print(f"exact-path accuracy at N={length} (rng budget 2): {exact_acc:.4f}")
+    print(f"exact-path accuracy at N={length}: {exact_acc:.4f}")
